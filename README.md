@@ -18,8 +18,8 @@ Em cada ciclo, o script coleta:
 
 - Ping ao gateway IPv4 da Claro (primeiro salto).
 - Ping a `1.1.1.1` e `8.8.8.8` para conectividade externa independente de DNS.
-- Resolução DNS pelo resolvedor configurado no Mac e diretamente pelo `1.1.1.1`.
-- Requisição HTTPS à Cloudflare em IPv4 e IPv6.
+- Resolução DNS pelo resolvedor configurado no Mac e diretamente pelo `1.1.1.1`, em UDP e TCP.
+- Requisição HTTPS à Cloudflare em IPv4 e IPv6, além de uma requisição IPv4 com o IP já resolvido para separar DNS de conexão TCP/HTTPS.
 - `networkQuality` do macOS quando disponível, em frequência configurável.
 
 Os testes de ping registram transmissão, recepção, perda, mínimo, média, máximo e desvio-padrão (usado como indicador de jitter). Eventos de perda, latência ou jitter acima dos limiares do script são destacados no log.
@@ -86,9 +86,9 @@ Sem `--output-dir`, uma pasta como `claro-monitor-20260822-213000/` é criada no
 | Arquivo | Conteúdo |
 | --- | --- |
 | `medicoes.csv` | Uma linha por alvo de ping e ciclo, com perda, latência e jitter. |
-| `dns.csv` | Resultado das consultas DNS pelo sistema e pelo `1.1.1.1`. |
-| `https.csv` | Status HTTP, tempos de conexão/primeiro byte/total e IP remoto, em IPv4 e IPv6. |
-| `networkquality.csv` | Capacidades, responsividade e RTT base coletados pelo `networkQuality`. |
+| `dns.csv` | Consultas DNS pelo sistema e pelo `1.1.1.1`, com transporte UDP/TCP e tempo de consulta. |
+| `https.csv` | Status HTTP, tempo de resolução, conexão/primeiro byte/total e IP remoto; inclui teste `pinned_ipv4`, sem DNS. |
+| `networkquality.csv` | Capacidades, responsividade e latência ociosa coletadas pelo `networkQuality`. |
 | `eventos.log` | Ciclos executados e alertas de degradação ou falha. |
 | `resumo.txt` | Consolidação final para leitura rápida. |
 | `networkquality/` | Saída bruta de cada execução de `networkQuality`, quando aplicável. |
@@ -97,7 +97,7 @@ Sem `--output-dir`, uma pasta como `claro-monitor-20260822-213000/` é criada no
 
 - Falha ou perda no gateway e também nos destinos externos aponta para o enlace local, modem, sinal/coaxial, CMTS ou rede da operadora.
 - Gateway estável e problemas apenas nos destinos externos sugerem falha após o primeiro salto ou em rotas externas.
-- Pings saudáveis, mas DNS ou HTTPS falhando, indicam um problema que não é explicado apenas por ICMP: resolução, rota, MTU, TLS ou conectividade de aplicação.
+- HTTPS `hostname` falho, mas `pinned_ipv4` bom, isola a falha para DNS. Se ambos falharem, o problema é conexão TCP, rota ou aplicação — não apenas DNS.
 - HTTPS IPv4 normal e IPv6 falho isola a investigação para IPv6.
 - Compare os horários de alertas com os dados de `networkQuality`. Boa capacidade nominal não impede latência alta sob carga; responsividade e RTT ajudam a evidenciar esse caso.
 

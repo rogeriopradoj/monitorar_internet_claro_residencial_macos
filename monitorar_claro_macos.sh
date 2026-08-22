@@ -12,6 +12,7 @@ PING_COUNT=10
 NQ_EVERY=4                 # 4 ciclos x 5 min = aproximadamente 20 min
 OUTPUT_DIR=""
 KEEP_NQ_RAW=1
+PINNED_IPV4=""             # IP obtido no DNS direto, usado no teste HTTPS sem DNS.
 
 usage() {
   cat <<'EOF'
@@ -96,8 +97,8 @@ event() {
 }
 
 printf 'timestamp,cycle,target,transmitted,received,loss_pct,min_ms,avg_ms,max_ms,jitter_ms,status\n' > "$MEASUREMENTS"
-printf 'timestamp,cycle,resolver,record_type,answer,latency_ms,status,detail\n' > "$DNS_CSV"
-printf 'timestamp,cycle,ip_family,url,http_code,connect_s,ttfb_s,total_s,remote_ip,status,detail\n' > "$HTTP_CSV"
+printf 'timestamp,cycle,resolver,transport,record_type,answer,query_ms,status,detail\n' > "$DNS_CSV"
+printf 'timestamp,cycle,test_mode,ip_family,hostname,resolved_ip,http_code,dns_lookup_s,connect_s,ttfb_s,total_s,remote_ip,status,detail\n' > "$HTTP_CSV"
 printf 'timestamp,cycle,status,upload_mbps,download_mbps,responsiveness_rpm,base_rtt_ms,raw_file\n' > "$NQ_CSV"
 
 command -v ping >/dev/null || { echo "O comando ping não foi encontrado." >&2; exit 1; }
@@ -127,30 +128,38 @@ ping_target() {
 }
 
 dns_test() {
-  local timestamp="$1" cycle="$2" resolver="$3" server="$4" output answer elapsed status detail start end
-  if [ "$HAS_DIG" -eq 0 ]; then csv "$timestamp" "$cycle" "$resolver" A '' '' unavailable 'dig ausente' >> "$DNS_CSV"; return; fi
-  start=$(date +%s)
-  if [ -n "$server" ]; then output=$(dig +time=4 +tries=1 +short A example.com "@$server" 2>&1); else output=$(dig +time=4 +tries=1 +short A example.com 2>&1); fi
-  end=$(date +%s); elapsed=$(( (end - start) * 1000 ))
-  answer=$(awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {print; exit}' <<<"$output")
+  local timestamp="$1" cycle="$2" resolver="$3" server="$4" transport="$5" output answer query_ms status detail
+  local -a dig_args=(+time=4 +tries=1 +noall +answer +stats A example.com)
+  if [ "$HAS_DIG" -eq 0 ]; then csv "$timestamp" "$cycle" "$resolver" "$transport" A '' '' unavailable 'dig ausente' >> "$DNS_CSV"; return; fi
+  [ "$transport" = tcp ] && dig_args=(+tcp "${dig_args[@]}")
+  if [ -n "$server" ]; then output=$(dig "${dig_args[@]}" "@$server" 2>&1); else output=$(dig "${dig_args[@]}" 2>&1); fi
+  answer=$(awk '$4 == "A" {print $5; exit}' <<<"$output")
+  query_ms=$(awk '/Query time:/ {print $4; exit}' <<<"$output")
   status=ok; detail=''
   if [ -z "$answer" ]; then status=failed; detail=$(tr '\n' ' ' <<<"$output" | cut -c1-180); event WARN "Ciclo $cycle: DNS via $resolver falhou: $detail"; fi
-  csv "$timestamp" "$cycle" "$resolver" A "$answer" "$elapsed" "$status" "$detail" >> "$DNS_CSV"
+  if [ "$resolver" = '1.1.1.1' ] && [ "$transport" = udp ] && [ -n "$answer" ]; then PINNED_IPV4="$answer"; fi
+  csv "$timestamp" "$cycle" "$resolver" "$transport" A "$answer" "$query_ms" "$status" "$detail" >> "$DNS_CSV"
 }
 
 https_test() {
-  local timestamp="$1" cycle="$2" family="$3" curl_flag="$4" url='https://www.cloudflare.com/cdn-cgi/trace' result code connect ttfb total remote status detail
-  if [ "$HAS_CURL" -eq 0 ]; then csv "$timestamp" "$cycle" "$family" "$url" '' '' '' '' '' unavailable 'curl ausente' >> "$HTTP_CSV"; return; fi
-  result=$(curl "$curl_flag" -sS -o /dev/null --connect-timeout 5 --max-time 15 -w '%{http_code}|%{time_connect}|%{time_starttransfer}|%{time_total}|%{remote_ip}' "$url" 2>&1)
-  if [[ "$result" == *'|'* ]]; then
-    IFS='|' read -r code connect ttfb total remote <<<"$result"
-    status=ok; detail=''
-    [[ "$code" =~ ^2[0-9][0-9]$ ]] || { status=failed; detail="HTTP $code"; }
-  else
-    code=''; connect=''; ttfb=''; total=''; remote=''; status=failed; detail=$(tr '\n' ' ' <<<"$result" | cut -c1-180)
+  local timestamp="$1" cycle="$2" family="$3" curl_flag="$4" mode="$5" resolved_ip="${6:-}"
+  local host='www.cloudflare.com' url="https://www.cloudflare.com/cdn-cgi/trace" result err_file curl_rc code dns connect ttfb total remote status detail
+  local -a curl_args=("$curl_flag" -sS -o /dev/null --connect-timeout 5 --max-time 15 -w '%{http_code}|%{time_namelookup}|%{time_connect}|%{time_starttransfer}|%{time_total}|%{remote_ip}')
+  if [ "$HAS_CURL" -eq 0 ]; then csv "$timestamp" "$cycle" "$mode" "$family" "$host" "$resolved_ip" '' '' '' '' '' '' unavailable 'curl ausente' >> "$HTTP_CSV"; return; fi
+  if [ "$mode" = pinned_ipv4 ]; then curl_args+=(--resolve "$host:443:$resolved_ip"); fi
+  err_file=$(mktemp "${TMPDIR:-/tmp}/claro-monitor-curl.XXXXXX") || { event WARN "Ciclo $cycle: não foi possível criar arquivo temporário para HTTPS."; return; }
+  result=$(curl "${curl_args[@]}" "$url" 2>"$err_file")
+  curl_rc=$?
+  detail=$(tr '\n' ' ' < "$err_file" | cut -c1-180)
+  rm -f "$err_file"
+  IFS='|' read -r code dns connect ttfb total remote <<<"$result"
+  status=ok
+  if [ "$curl_rc" -ne 0 ] || ! [[ "$code" =~ ^2[0-9][0-9]$ ]]; then
+    status=failed
+    [ -n "$detail" ] || detail="HTTP ${code:-sem código}"
   fi
-  csv "$timestamp" "$cycle" "$family" "$url" "$code" "$connect" "$ttfb" "$total" "$remote" "$status" "$detail" >> "$HTTP_CSV"
-  [ "$status" = ok ] || event WARN "Ciclo $cycle: HTTPS IPv$family falhou: ${detail:-HTTP $code}."
+  csv "$timestamp" "$cycle" "$mode" "$family" "$host" "$resolved_ip" "$code" "$dns" "$connect" "$ttfb" "$total" "$remote" "$status" "$detail" >> "$HTTP_CSV"
+  [ "$status" = ok ] || event WARN "Ciclo $cycle: HTTPS $mode IPv$family falhou: $detail"
 }
 
 network_quality_test() {
@@ -159,10 +168,10 @@ network_quality_test() {
   raw="$OUTPUT_DIR/networkquality/ciclo-$(printf '%03d' "$cycle").txt"
   output=$(networkQuality -v 2>&1 || true)
   printf '%s\n' "$output" > "$raw"
-  up=$(awk -F': ' '/Upload capacity:/ {gsub(/ Mbps/,"",$2); print $2; exit}' <<<"$output")
-  down=$(awk -F': ' '/Download capacity:/ {gsub(/ Mbps/,"",$2); print $2; exit}' <<<"$output")
-  rpm=$(awk -F'[()]' '/Responsiveness:/ {gsub(/ RPM/,"",$2); print $2; exit}' <<<"$output")
-  rtt=$(awk -F': ' '/Base RTT:/ {gsub(/ ms/,"",$2); print $2; exit}' <<<"$output")
+  up=$(awk -F': ' '/^(Uplink|Upload) capacity:/ {gsub(/ Mbps/,"",$2); print $2; exit}' <<<"$output")
+  down=$(awk -F': ' '/^(Downlink|Download) capacity:/ {gsub(/ Mbps/,"",$2); print $2; exit}' <<<"$output")
+  rpm=$(awk -F'[()| ]+' '/Responsiveness:/ {for (i=1; i<=NF; i++) if ($i == "RPM") {print $(i-1); exit}}' <<<"$output")
+  rtt=$(awk '/^(Base RTT|Idle Latency):/ {for (i=1; i<=NF; i++) if ($i ~ /^[0-9.]+$/ && $(i+1) ~ /^(milliseconds|ms)$/) {print $i; exit}}' <<<"$output")
   status=ok
   if ! is_number "${down:-}" || ! is_number "${up:-}"; then status=failed; event WARN "Ciclo $cycle: networkQuality não retornou capacidades; veja $raw."; fi
   csv "$timestamp" "$cycle" "$status" "$up" "$down" "$rpm" "$rtt" "$raw" >> "$NQ_CSV"
@@ -181,12 +190,13 @@ write_summary() {
     echo "Ping por destino (média das médias; perda total; pior média; maior jitter):"
     awk -F, 'NR>1 {gsub(/\"/,"",$0); t=$3; tx[t]+=$4; rx[t]+=$5; if($8!=""){sum[t]+=$8;n[t]++} if($8+0>maxavg[t])maxavg[t]=$8; if($10+0>maxjit[t])maxjit[t]=$10} END {for(t in tx) printf "  %-16s média=%7.2f ms | perda=%6.2f%% (%d/%d) | pior média=%7.2f ms | maior jitter=%7.2f ms\n",t,(n[t]?sum[t]/n[t]:0),100*(tx[t]-rx[t])/tx[t],tx[t]-rx[t],tx[t],maxavg[t],maxjit[t]}' "$MEASUREMENTS" | sort
     echo
-    echo "Falhas: DNS=$(awk -F, 'NR>1 && $7 != "\"ok\"" {n++} END {print n+0}' "$DNS_CSV") | HTTPS=$(awk -F, 'NR>1 && $10 != "\"ok\"" {n++} END {print n+0}' "$HTTP_CSV") | eventos WARN=$(grep -c '\[WARN\]' "$EVENTS" 2>/dev/null || true)"
+    echo "Falhas: DNS=$(awk -F, 'NR>1 && $8 != "\"ok\"" {n++} END {print n+0}' "$DNS_CSV") | HTTPS=$(awk -F, 'NR>1 && $13 != "\"ok\"" {n++} END {print n+0}' "$HTTP_CSV") | eventos WARN=$(grep -c '\[WARN\]' "$EVENTS" 2>/dev/null || true)"
     echo
     echo "Leitura rápida:"
     echo "  • Problema no gateway junto com destinos externos sugere enlace modem/Claro/CMTS."
     echo "  • Gateway limpo, mas 1.1.1.1/8.8.8.8 ruins sugere problema além do primeiro salto."
-    echo "  • IPs bons, porém DNS/HTTPS falhando, sugere resolução, rota ou aplicação — não perda ICMP simples."
+    echo "  • HTTPS hostname falho, mas HTTPS pinned_ipv4 bom, aponta especificamente para DNS."
+    echo "  • HTTPS hostname e pinned_ipv4 falhando sugere conexão TCP/rota/aplicação — não apenas DNS."
     echo "  • HTTPS IPv4 bom e IPv6 falho isola o problema na conectividade IPv6."
     echo "  • Compare horários de WARN com capacidade/RTT do networkQuality; latência carregada alta costuma aparecer como responsividade menor."
     echo
@@ -215,10 +225,13 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
   ping_target "$TS" "$CYCLE" "$GATEWAY" gateway
   ping_target "$TS" "$CYCLE" '1.1.1.1' internet
   ping_target "$TS" "$CYCLE" '8.8.8.8' internet
-  dns_test "$TS" "$CYCLE" system ''
-  dns_test "$TS" "$CYCLE" '1.1.1.1' '1.1.1.1'
-  https_test "$TS" "$CYCLE" 4 -4
-  https_test "$TS" "$CYCLE" 6 -6
+  PINNED_IPV4=''
+  dns_test "$TS" "$CYCLE" system '' udp
+  dns_test "$TS" "$CYCLE" '1.1.1.1' '1.1.1.1' udp
+  dns_test "$TS" "$CYCLE" '1.1.1.1' '1.1.1.1' tcp
+  https_test "$TS" "$CYCLE" 4 -4 hostname
+  https_test "$TS" "$CYCLE" 6 -6 hostname
+  if [ -n "$PINNED_IPV4" ]; then https_test "$TS" "$CYCLE" 4 -4 pinned_ipv4 "$PINNED_IPV4"; fi
   if [ "$NQ_EVERY" -gt 0 ] && [ $((CYCLE % NQ_EVERY)) -eq 0 ]; then network_quality_test "$TS" "$CYCLE"; fi
   event INFO "Ciclo $CYCLE concluído."
   NEXT=$((START_EPOCH + CYCLE * INTERVAL_MIN * 60))
