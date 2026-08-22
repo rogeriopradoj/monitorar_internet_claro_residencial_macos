@@ -76,6 +76,7 @@ MEASUREMENTS="$OUTPUT_DIR/medicoes.csv"
 DNS_CSV="$OUTPUT_DIR/dns.csv"
 HTTP_CSV="$OUTPUT_DIR/https.csv"
 NQ_CSV="$OUTPUT_DIR/networkquality.csv"
+PORTS_CSV="$OUTPUT_DIR/portas_tcp.csv"
 EVENTS="$OUTPUT_DIR/eventos.log"
 SUMMARY="$OUTPUT_DIR/resumo.txt"
 
@@ -100,15 +101,18 @@ printf 'timestamp,cycle,target,transmitted,received,loss_pct,min_ms,avg_ms,max_m
 printf 'timestamp,cycle,resolver,transport,record_type,answer,query_ms,status,detail\n' > "$DNS_CSV"
 printf 'timestamp,cycle,test_mode,ip_family,hostname,resolved_ip,http_code,dns_lookup_s,connect_s,ttfb_s,total_s,remote_ip,status,detail\n' > "$HTTP_CSV"
 printf 'timestamp,cycle,status,upload_mbps,download_mbps,responsiveness_rpm,base_rtt_ms,raw_file\n' > "$NQ_CSV"
+printf 'timestamp,cycle,provider,target,ip_family,port,service,status,detail\n' > "$PORTS_CSV"
 
 command -v ping >/dev/null || { echo "O comando ping não foi encontrado." >&2; exit 1; }
 HAS_DIG=0; command -v dig >/dev/null && HAS_DIG=1
 HAS_CURL=0; command -v curl >/dev/null && HAS_CURL=1
 HAS_NQ=0; command -v networkQuality >/dev/null && HAS_NQ=1
+HAS_NC=0; command -v nc >/dev/null && HAS_NC=1
 
 if [ "$HAS_NQ" -eq 0 ]; then event INFO 'networkQuality não está disponível neste macOS; os demais testes continuarão.'; fi
 if [ "$HAS_DIG" -eq 0 ]; then event WARN 'dig não está disponível; o teste DNS será marcado como indisponível.'; fi
 if [ "$HAS_CURL" -eq 0 ]; then event WARN 'curl não está disponível; os testes HTTPS serão marcados como indisponíveis.'; fi
+if [ "$HAS_NC" -eq 0 ]; then event WARN 'nc não está disponível; as sondas TCP 53/853 serão marcadas como indisponíveis.'; fi
 
 ping_target() {
   local timestamp="$1" cycle="$2" target="$3" label="$4" output tx rx loss min avg max jitter status
@@ -136,9 +140,38 @@ dns_test() {
   answer=$(awk '$4 == "A" {print $5; exit}' <<<"$output")
   query_ms=$(awk '/Query time:/ {print $4; exit}' <<<"$output")
   status=ok; detail=''
-  if [ -z "$answer" ]; then status=failed; detail=$(tr '\n' ' ' <<<"$output" | cut -c1-180); event WARN "Ciclo $cycle: DNS via $resolver falhou: $detail"; fi
+  if [ -z "$answer" ]; then
+    detail=$(tr '\n' ' ' <<<"$output" | cut -c1-180)
+    case "$detail" in
+      *'end of file'*|*'Connection refused'*) status=refused_tcp_53 ;;
+      *) status=failed; event WARN "Ciclo $cycle: DNS via $resolver ($transport) falhou: $detail" ;;
+    esac
+  fi
   if [ "$resolver" = '1.1.1.1' ] && [ "$transport" = udp ] && [ -n "$answer" ]; then PINNED_IPV4="$answer"; fi
   csv "$timestamp" "$cycle" "$resolver" "$transport" A "$answer" "$query_ms" "$status" "$detail" >> "$DNS_CSV"
+}
+
+tcp_port_probe() {
+  local timestamp="$1" cycle="$2" provider="$3" target="$4" family="$5" port="$6" service="$7"
+  local output status detail nc_rc
+  local -a nc_args=(-zv -w 3)
+  if [ "$HAS_NC" -eq 0 ]; then csv "$timestamp" "$cycle" "$provider" "$target" "$family" "$port" "$service" unavailable 'nc ausente' >> "$PORTS_CSV"; return; fi
+  [ "$family" = 6 ] && nc_args+=(-6)
+  output=$(nc "${nc_args[@]}" "$target" "$port" 2>&1)
+  nc_rc=$?
+  detail=$(tr '\n' ' ' <<<"$output" | cut -c1-180)
+  if [ "$nc_rc" -eq 0 ]; then
+    status=open
+  elif [[ "$detail" == *'Connection refused'* ]]; then
+    status=refused
+  elif [[ "$detail" == *'Operation timed out'* || "$detail" == *'Connection timed out'* ]]; then
+    status=timeout
+    event WARN "Ciclo $cycle: TCP/$port para $provider ($target) expirou."
+  else
+    status=failed
+    event WARN "Ciclo $cycle: sonda TCP/$port para $provider ($target) falhou: $detail"
+  fi
+  csv "$timestamp" "$cycle" "$provider" "$target" "$family" "$port" "$service" "$status" "$detail" >> "$PORTS_CSV"
 }
 
 https_test() {
@@ -190,7 +223,8 @@ write_summary() {
     echo "Ping por destino (média das médias; perda total; pior média; maior jitter):"
     awk -F, 'NR>1 {gsub(/\"/,"",$0); t=$3; tx[t]+=$4; rx[t]+=$5; if($8!=""){sum[t]+=$8;n[t]++} if($8+0>maxavg[t])maxavg[t]=$8; if($10+0>maxjit[t])maxjit[t]=$10} END {for(t in tx) printf "  %-16s média=%7.2f ms | perda=%6.2f%% (%d/%d) | pior média=%7.2f ms | maior jitter=%7.2f ms\n",t,(n[t]?sum[t]/n[t]:0),100*(tx[t]-rx[t])/tx[t],tx[t]-rx[t],tx[t],maxavg[t],maxjit[t]}' "$MEASUREMENTS" | sort
     echo
-    echo "Falhas: DNS=$(awk -F, 'NR>1 && $8 != "\"ok\"" {n++} END {print n+0}' "$DNS_CSV") | HTTPS=$(awk -F, 'NR>1 && $13 != "\"ok\"" {n++} END {print n+0}' "$HTTP_CSV") | eventos WARN=$(grep -c '\[WARN\]' "$EVENTS" 2>/dev/null || true)"
+    echo "Falhas: DNS=$(awk -F, 'NR>1 && $8 == "\"failed\"" {n++} END {print n+0}' "$DNS_CSV") | DNS TCP/53 recusado=$(awk -F, 'NR>1 && $8 == "\"refused_tcp_53\"" {n++} END {print n+0}' "$DNS_CSV") | HTTPS=$(awk -F, 'NR>1 && $13 != "\"ok\"" {n++} END {print n+0}' "$HTTP_CSV") | eventos WARN=$(grep -c '\[WARN\]' "$EVENTS" 2>/dev/null || true)"
+    echo "Sondas TCP: 53 aberta=$(awk -F, 'NR>1 && $6 == "\"53\"" && $8 == "\"open\"" {n++} END {print n+0}' "$PORTS_CSV") | 53 recusada=$(awk -F, 'NR>1 && $6 == "\"53\"" && $8 == "\"refused\"" {n++} END {print n+0}' "$PORTS_CSV") | 853 aberta=$(awk -F, 'NR>1 && $6 == "\"853\"" && $8 == "\"open\"" {n++} END {print n+0}' "$PORTS_CSV")"
     echo
     echo "Leitura rápida:"
     echo "  • Problema no gateway junto com destinos externos sugere enlace modem/Claro/CMTS."
@@ -200,7 +234,7 @@ write_summary() {
     echo "  • HTTPS IPv4 bom e IPv6 falho isola o problema na conectividade IPv6."
     echo "  • Compare horários de WARN com capacidade/RTT do networkQuality; latência carregada alta costuma aparecer como responsividade menor."
     echo
-    echo "Arquivos: medicoes.csv, dns.csv, https.csv, networkquality.csv, eventos.log e networkquality/."
+    echo "Arquivos: medicoes.csv, dns.csv, https.csv, portas_tcp.csv, networkquality.csv, eventos.log e networkquality/."
   } > "$SUMMARY"
   cat "$SUMMARY"
 }
@@ -229,6 +263,14 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
   dns_test "$TS" "$CYCLE" system '' udp
   dns_test "$TS" "$CYCLE" '1.1.1.1' '1.1.1.1' udp
   dns_test "$TS" "$CYCLE" '1.1.1.1' '1.1.1.1' tcp
+  tcp_port_probe "$TS" "$CYCLE" Cloudflare '1.1.1.1' 4 53 dns_tcp
+  tcp_port_probe "$TS" "$CYCLE" Google '8.8.8.8' 4 53 dns_tcp
+  tcp_port_probe "$TS" "$CYCLE" Cloudflare '2606:4700:4700::1111' 6 53 dns_tcp
+  tcp_port_probe "$TS" "$CYCLE" Google '2001:4860:4860::8888' 6 53 dns_tcp
+  tcp_port_probe "$TS" "$CYCLE" Cloudflare '1.1.1.1' 4 853 dot_tcp
+  tcp_port_probe "$TS" "$CYCLE" Google '8.8.8.8' 4 853 dot_tcp
+  tcp_port_probe "$TS" "$CYCLE" Cloudflare '2606:4700:4700::1111' 6 853 dot_tcp
+  tcp_port_probe "$TS" "$CYCLE" Google '2001:4860:4860::8888' 6 853 dot_tcp
   https_test "$TS" "$CYCLE" 4 -4 hostname
   https_test "$TS" "$CYCLE" 6 -6 hostname
   if [ -n "$PINNED_IPV4" ]; then https_test "$TS" "$CYCLE" 4 -4 pinned_ipv4 "$PINNED_IPV4"; fi

@@ -19,6 +19,7 @@ Em cada ciclo, o script coleta:
 - Ping ao gateway IPv4 da Claro (primeiro salto).
 - Ping a `1.1.1.1` e `8.8.8.8` para conectividade externa independente de DNS.
 - Resolução DNS pelo resolvedor configurado no Mac e diretamente pelo `1.1.1.1`, em UDP e TCP.
+- Sondas TCP para DNS convencional (porta 53) e DNS-over-TLS (porta 853), em Cloudflare e Google, IPv4 e IPv6.
 - Requisição HTTPS à Cloudflare em IPv4 e IPv6, além de uma requisição IPv4 com o IP já resolvido para separar DNS de conexão TCP/HTTPS.
 - `networkQuality` do macOS quando disponível, em frequência configurável.
 
@@ -86,8 +87,9 @@ Sem `--output-dir`, uma pasta como `claro-monitor-20260822-213000/` é criada no
 | Arquivo | Conteúdo |
 | --- | --- |
 | `medicoes.csv` | Uma linha por alvo de ping e ciclo, com perda, latência e jitter. |
-| `dns.csv` | Consultas DNS pelo sistema e pelo `1.1.1.1`, com transporte UDP/TCP e tempo de consulta. |
+| `dns.csv` | Consultas DNS pelo sistema e pelo `1.1.1.1`, com transporte UDP/TCP e tempo de consulta. Recusa de TCP/53 é registrada separadamente de falha DNS. |
 | `https.csv` | Status HTTP, tempo de resolução, conexão/primeiro byte/total e IP remoto; inclui teste `pinned_ipv4`, sem DNS. |
+| `portas_tcp.csv` | Estado das portas TCP 53 e 853 para Cloudflare e Google em IPv4/IPv6 (`open`, `refused`, `timeout` ou `failed`). |
 | `networkquality.csv` | Capacidades, responsividade e latência ociosa coletadas pelo `networkQuality`. |
 | `eventos.log` | Ciclos executados e alertas de degradação ou falha. |
 | `resumo.txt` | Consolidação final para leitura rápida. |
@@ -98,6 +100,8 @@ Sem `--output-dir`, uma pasta como `claro-monitor-20260822-213000/` é criada no
 - Falha ou perda no gateway e também nos destinos externos aponta para o enlace local, modem, sinal/coaxial, CMTS ou rede da operadora.
 - Gateway estável e problemas apenas nos destinos externos sugerem falha após o primeiro salto ou em rotas externas.
 - HTTPS `hostname` falho, mas `pinned_ipv4` bom, isola a falha para DNS. Se ambos falharem, o problema é conexão TCP, rota ou aplicação — não apenas DNS.
+- TCP/53 `refused` com UDP/53 e HTTPS saudáveis indica uma política ou bloqueio específico de DNS/TCP; não é contabilizado como indisponibilidade geral de DNS.
+- TCP/853 `open` mostra que a porta de DNS-over-TLS aceita conexão TCP, mas não substitui a validação de uma consulta DoT completa.
 - HTTPS IPv4 normal e IPv6 falho isola a investigação para IPv6.
 - Compare os horários de alertas com os dados de `networkQuality`. Boa capacidade nominal não impede latência alta sob carga; responsividade e RTT ajudam a evidenciar esse caso.
 
