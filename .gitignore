@@ -1,0 +1,9 @@
+# Resultados produzidos por execuções do monitor.
+# Podem conter IP público, horários e detalhes da conexão.
+claro-monitor-*/
+resultados/
+
+# Metadados locais do macOS e editores.
+.DS_Store
+.vscode/
+.idea/
