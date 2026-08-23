@@ -1,6 +1,6 @@
 # Monitor de Internet Claro Residencial para macOS
 
-Um monitor Bash, sem instalações adicionais, para investigar conexão instável da Claro residencial quando o Mac está conectado diretamente ao modem em modo bridge.
+Um monitor Bash, sem instalações adicionais, para investigar conexão instável e comparar cenários de rede no macOS — por exemplo, roteador restaurado, Tailscale normal e Tailscale com Exit Node.
 
 Ele registra medições recorrentes em CSV e eventos em log para separar falhas do primeiro salto, Internet, DNS, HTTPS e IPv6. Ao encerrar, produz um resumo textual com perda, latência e jitter.
 
@@ -22,6 +22,8 @@ Em cada ciclo, o script coleta:
 - Sondas TCP para DNS convencional (porta 53) e DNS-over-TLS (porta 853), em Cloudflare e Google, IPv4 e IPv6.
 - Requisição HTTPS à Cloudflare em IPv4 e IPv6, além de uma requisição IPv4 com o IP já resolvido para separar DNS de conexão TCP/HTTPS.
 - `networkQuality` do macOS quando disponível, em frequência configurável.
+- Rota efetiva IPv4/IPv6 a cada ciclo, para confirmar por qual interface os testes saíram.
+- Contexto da execução: cenário informado, gateway, interface e MACs locais; caso presente, um retrato inicial do estado do Tailscale.
 
 Os testes de ping registram transmissão, recepção, perda, mínimo, média, máximo e desvio-padrão (usado como indicador de jitter). Eventos de perda, latência ou jitter acima dos limiares do script são destacados no log.
 
@@ -33,7 +35,7 @@ Os testes de ping registram transmissão, recepção, perda, mínimo, média, m�
 
 Não requer `brew`, Docker, Python, Node.js ou serviços externos instalados.
 
-O gateway é detectado automaticamente a partir da rota padrão do macOS. Caso o Mac tenha VPN, múltiplas rotas ou uma topologia incomum, informe-o explicitamente com `--gateway IPV4`.
+O gateway é detectado automaticamente a partir da rota padrão do macOS. Caso o Mac tenha VPN, múltiplas rotas ou uma topologia incomum, informe-o explicitamente com `--gateway IPV4`. Ao usar Tailscale como Exit Node, `rotas.csv` mostra a rota realmente usada para os destinos de teste; esse registro é mais confiável do que supor a topologia a partir da configuração.
 
 ## Instalação
 
@@ -63,8 +65,26 @@ Exemplo de uma sessão de uma hora, a cada dois minutos, gravando os resultados 
 ./monitorar_claro_macos.sh \
   --duration 60 \
   --interval 2 \
+  --scenario 01-fabrica \
   --output-dir resultados/2026-08-22-noite
 ```
+
+## Comparação entre cenários do GL-MT2500
+
+Mantenha o mesmo Mac, conexão física, duração e intervalo para que a comparação seja válida. Use um diretório e rótulo diferentes para cada etapa:
+
+```bash
+./monitorar_claro_macos.sh --duration 120 --interval 2 --network-quality-every 20 \
+  --scenario 01-fabrica --output-dir resultados/01-fabrica
+
+./monitorar_claro_macos.sh --duration 120 --interval 2 --network-quality-every 20 \
+  --scenario 02-tailscale --output-dir resultados/02-tailscale
+
+./monitorar_claro_macos.sh --duration 120 --interval 2 --network-quality-every 20 \
+  --scenario 03-exit-node --output-dir resultados/03-exit-node
+```
+
+Altere apenas o cenário sob investigação. Antes de cada execução, anote qualquer mudança física ou de configuração feita no GL-MT2500. `contexto.txt` e `rotas.csv` permitem confirmar posteriormente se o Mac utilizou o caminho esperado.
 
 Para executar `networkQuality` em todos os ciclos (ele pode transferir dados e tornar o teste mais intrusivo):
 
@@ -90,6 +110,9 @@ Sem `--output-dir`, uma pasta como `claro-monitor-20260822-213000/` é criada no
 | `dns.csv` | Consultas DNS pelo sistema e pelo `1.1.1.1`, com transporte UDP/TCP e tempo de consulta. Recusa de TCP/53 é registrada separadamente de falha DNS. |
 | `https.csv` | Status HTTP, tempo de resolução, conexão/primeiro byte/total e IP remoto; inclui teste `pinned_ipv4`, sem DNS. |
 | `portas_tcp.csv` | Estado das portas TCP 53 e 853 para Cloudflare e Google em IPv4/IPv6 (`open`, `refused`, `timeout` ou `failed`). |
+| `rotas.csv` | Gateway e interface efetivamente selecionados pelo macOS para os alvos IPv4 e IPv6 de cada ciclo. |
+| `contexto.txt` | Cenário, rotas padrão, interface, MACs e presença/versão do Tailscale no começo da execução. |
+| `tailscale-status-inicio.*` | Retrato inicial do Tailscale, quando o comando está instalado. Pode conter nomes e endereços da tailnet. |
 | `networkquality.csv` | Capacidades, responsividade e latência ociosa coletadas pelo `networkQuality`. |
 | `eventos.log` | Ciclos executados e alertas de degradação ou falha. |
 | `resumo.txt` | Consolidação final para leitura rápida. |
@@ -110,6 +133,8 @@ O ICMP pode ser tratado com prioridade menor por algumas redes. Por isso, a conc
 ## Privacidade e versionamento dos resultados
 
 Os resultados não são versionados por padrão. Eles podem revelar IP público, horário de uso, resolvedores, IPs remotos e características da conexão. O `.gitignore` exclui as pastas de execução produzidas pelo script e a pasta `resultados/`.
+
+O retrato do Tailscale também pode revelar dispositivos, nomes e endereços da sua tailnet. Trate `tailscale-status-inicio.*` como material privado.
 
 Se for útil anexar um caso a uma issue ou compartilhar com o suporte, prefira exportar uma cópia revisada, removendo IPs públicos e dados pessoais. Amostras deliberadamente anonimizadas podem ser guardadas em `examples/`.
 

@@ -13,6 +13,7 @@ NQ_EVERY=4                 # 4 ciclos x 5 min = aproximadamente 20 min
 OUTPUT_DIR=""
 KEEP_NQ_RAW=1
 PINNED_IPV4=""             # IP obtido no DNS direto, usado no teste HTTPS sem DNS.
+SCENARIO="nao-informado"   # Rótulo para comparar execuções com a mesma metodologia.
 
 usage() {
   cat <<'EOF'
@@ -26,6 +27,7 @@ Uso: monitorar_claro_macos.sh [opções]
                                Executa networkQuality a cada N ciclos (padrão: 4;
                                use 1 para todos os ciclos e 0 para desativar)
   -o, --output-dir DIRETÓRIO   Diretório dos resultados (padrão: claro-monitor-AAA...)
+  -s, --scenario NOME          Rótulo do cenário (ex.: 01-fabrica, 02-tailscale)
   -h, --help                   Mostra esta ajuda
 
 Exemplo (2 h, a cada 5 min):
@@ -47,6 +49,7 @@ while [ $# -gt 0 ]; do
     -p|--ping-count) require_value "$@"; PING_COUNT="$2"; shift 2 ;;
     -n|--network-quality-every) require_value "$@"; NQ_EVERY="$2"; shift 2 ;;
     -o|--output-dir) require_value "$@"; OUTPUT_DIR="$2"; shift 2 ;;
+    -s|--scenario) require_value "$@"; SCENARIO="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Opção desconhecida: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -77,8 +80,10 @@ DNS_CSV="$OUTPUT_DIR/dns.csv"
 HTTP_CSV="$OUTPUT_DIR/https.csv"
 NQ_CSV="$OUTPUT_DIR/networkquality.csv"
 PORTS_CSV="$OUTPUT_DIR/portas_tcp.csv"
+ROUTES_CSV="$OUTPUT_DIR/rotas.csv"
 EVENTS="$OUTPUT_DIR/eventos.log"
 SUMMARY="$OUTPUT_DIR/resumo.txt"
+CONTEXT="$OUTPUT_DIR/contexto.txt"
 
 csv() { # Escapa aspas para CSV e mantém o separador consistente.
   local first=1 item escaped
@@ -102,17 +107,69 @@ printf 'timestamp,cycle,resolver,transport,record_type,answer,query_ms,status,de
 printf 'timestamp,cycle,test_mode,ip_family,hostname,resolved_ip,http_code,dns_lookup_s,connect_s,ttfb_s,total_s,remote_ip,status,detail\n' > "$HTTP_CSV"
 printf 'timestamp,cycle,status,upload_mbps,download_mbps,responsiveness_rpm,base_rtt_ms,raw_file\n' > "$NQ_CSV"
 printf 'timestamp,cycle,provider,target,ip_family,port,service,status,detail\n' > "$PORTS_CSV"
+printf 'timestamp,cycle,scenario,ip_family,target,gateway,interface,status\n' > "$ROUTES_CSV"
 
 command -v ping >/dev/null || { echo "O comando ping não foi encontrado." >&2; exit 1; }
 HAS_DIG=0; command -v dig >/dev/null && HAS_DIG=1
 HAS_CURL=0; command -v curl >/dev/null && HAS_CURL=1
 HAS_NQ=0; command -v networkQuality >/dev/null && HAS_NQ=1
 HAS_NC=0; command -v nc >/dev/null && HAS_NC=1
+HAS_TAILSCALE=0; command -v tailscale >/dev/null && HAS_TAILSCALE=1
 
 if [ "$HAS_NQ" -eq 0 ]; then event INFO 'networkQuality não está disponível neste macOS; os demais testes continuarão.'; fi
 if [ "$HAS_DIG" -eq 0 ]; then event WARN 'dig não está disponível; o teste DNS será marcado como indisponível.'; fi
 if [ "$HAS_CURL" -eq 0 ]; then event WARN 'curl não está disponível; os testes HTTPS serão marcados como indisponíveis.'; fi
 if [ "$HAS_NC" -eq 0 ]; then event WARN 'nc não está disponível; as sondas TCP 53/853 serão marcadas como indisponíveis.'; fi
+
+route_probe() {
+  local timestamp="$1" cycle="$2" family="$3" target="$4" output gateway interface status
+  if [ "$family" = 6 ]; then
+    output=$(route -n get -inet6 "$target" 2>&1 || true)
+  else
+    output=$(route -n get "$target" 2>&1 || true)
+  fi
+  gateway=$(awk '/gateway:/{print $2; exit}' <<<"$output")
+  interface=$(awk '/interface:/{print $2; exit}' <<<"$output")
+  status=ok
+  [ -n "$interface" ] || status=failed
+  csv "$timestamp" "$cycle" "$SCENARIO" "$family" "$target" "$gateway" "$interface" "$status" >> "$ROUTES_CSV"
+  [ "$status" = ok ] || event WARN "Ciclo $cycle: não foi possível determinar a rota IPv$family para $target."
+}
+
+write_context() {
+  local default_route default_interface gateway_mac
+  default_route=$(route -n get default 2>&1 || true)
+  default_interface=$(awk '/interface:/{print $2; exit}' <<<"$default_route")
+  gateway_mac=$(arp -an "$GATEWAY" 2>/dev/null | awk 'NR==1 {gsub(/[()]/,"",$4); print $4; exit}')
+  {
+    echo "CONTEXTO DA EXECUÇÃO"
+    echo "Gerado: $(date '+%Y-%m-%d %H:%M:%S %z')"
+    echo "Cenário: $SCENARIO"
+    echo "Gateway padrão: $GATEWAY"
+    echo "Interface padrão: ${default_interface:-indisponível}"
+    echo "MAC do gateway: ${gateway_mac:-indisponível}"
+    if [ -n "$default_interface" ]; then
+      echo "MAC da interface: $(ifconfig "$default_interface" 2>/dev/null | awk '/ether / {print $2; exit}')"
+    fi
+    echo
+    echo "Rota IPv4 padrão:"
+    printf '%s\n' "$default_route"
+    echo
+    echo "Rota IPv6 padrão:"
+    route -n get -inet6 default 2>&1 || true
+    echo
+    if [ "$HAS_TAILSCALE" -eq 1 ]; then
+      echo "Tailscale: instalado"
+      tailscale version 2>&1 || true
+    else
+      echo "Tailscale: não encontrado"
+    fi
+  } > "$CONTEXT"
+  if [ "$HAS_TAILSCALE" -eq 1 ]; then
+    tailscale status > "$OUTPUT_DIR/tailscale-status-inicio.txt" 2>&1 || true
+    tailscale status --json > "$OUTPUT_DIR/tailscale-status-inicio.json" 2>/dev/null || true
+  fi
+}
 
 ping_target() {
   local timestamp="$1" cycle="$2" target="$3" label="$4" output tx rx loss min avg max jitter status
@@ -215,9 +272,10 @@ write_summary() {
   local now elapsed cycles
   now=$(date +%s); elapsed=$((now - START_EPOCH)); cycles=$(awk 'END {print NR-1}' "$MEASUREMENTS")
   {
-    echo "RESUMO — monitor Claro"
+    echo "RESUMO — monitor de conectividade"
     echo "Gerado: $(date '+%Y-%m-%d %H:%M:%S %z')"
     echo "Duração observada: $((elapsed / 60)) min $((elapsed % 60)) s"
+    echo "Cenário: $SCENARIO"
     echo "Gateway configurado: $GATEWAY | Pings por destino/ciclo: $PING_COUNT"
     echo
     echo "Ping por destino (média das médias; perda total; pior média; maior jitter):"
@@ -234,7 +292,7 @@ write_summary() {
     echo "  • HTTPS IPv4 bom e IPv6 falho isola o problema na conectividade IPv6."
     echo "  • Compare horários de WARN com capacidade/RTT do networkQuality; latência carregada alta costuma aparecer como responsividade menor."
     echo
-    echo "Arquivos: medicoes.csv, dns.csv, https.csv, portas_tcp.csv, networkquality.csv, eventos.log e networkquality/."
+    echo "Arquivos: contexto.txt, rotas.csv, medicoes.csv, dns.csv, https.csv, portas_tcp.csv, networkquality.csv, eventos.log e networkquality/."
   } > "$SUMMARY"
   cat "$SUMMARY"
 }
@@ -246,7 +304,8 @@ on_exit() {
 trap on_exit EXIT
 trap 'event INFO "Interrompido pelo usuário (Ctrl-C)."; exit 0' INT TERM
 
-event INFO "Início: duração ${DURATION_MIN} min, intervalo ${INTERVAL_MIN} min, gateway $GATEWAY. Resultados: $OUTPUT_DIR"
+write_context
+event INFO "Início: cenário $SCENARIO, duração ${DURATION_MIN} min, intervalo ${INTERVAL_MIN} min, gateway $GATEWAY. Resultados: $OUTPUT_DIR"
 echo "Monitorando. Resultados em: $OUTPUT_DIR"
 echo "Use Ctrl-C para encerrar antes; o resumo será preservado."
 
@@ -256,6 +315,8 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
   CYCLE=$((CYCLE + 1))
   TS=$(date '+%Y-%m-%dT%H:%M:%S%z')
   event INFO "Ciclo $CYCLE iniciado."
+  route_probe "$TS" "$CYCLE" 4 '1.1.1.1'
+  route_probe "$TS" "$CYCLE" 6 '2606:4700:4700::1111'
   ping_target "$TS" "$CYCLE" "$GATEWAY" gateway
   ping_target "$TS" "$CYCLE" '1.1.1.1' internet
   ping_target "$TS" "$CYCLE" '8.8.8.8' internet
